@@ -32,11 +32,7 @@ export default function AuthGate({ children }: Props) {
   if (!isAuthed) {
     return (
       <div style={{ maxWidth: 420, margin: '48px auto' }}>
-        <Auth
-          supabaseClient={supabase}
-          appearance={{ theme: ThemeSupa }}
-          providers={['google']}
-        />
+        <Auth supabaseClient={supabase} appearance={{ theme: ThemeSupa }} />
       </div>
     )
   }
