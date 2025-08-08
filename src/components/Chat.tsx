@@ -121,9 +121,12 @@ export default function Chat() {
         { role: 'user' as const, content: userMessageContent },
       ]
 
-      // Call Edge Function
+      // Call Edge Function with user access token
+      const { data: sessionData } = await supabase.auth.getSession()
+      const accessToken = sessionData.session?.access_token
       const { data: response, error } = await supabase.functions.invoke('openrouter-chat', {
         body: { messages: messagesForLLM },
+        headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
       })
       if (error) throw error
       const assistantText = (response?.content as string) ?? ''
