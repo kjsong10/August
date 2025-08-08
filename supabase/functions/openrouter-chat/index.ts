@@ -60,7 +60,7 @@ serve(async (req) => {
   }
 
   const messages = body.messages ?? []
-  const model = body.model || 'openai/gpt-4o-mini'
+  const model = body.model || 'openai/gpt-oss-20b:free'
   if (!Array.isArray(messages) || messages.length === 0) {
     return new Response(JSON.stringify({ error: 'messages must be a non-empty array' }), {
       status: 400,
