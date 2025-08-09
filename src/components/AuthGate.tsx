@@ -31,8 +31,41 @@ export default function AuthGate({ children }: Props) {
 
   if (!isAuthed) {
     return (
-      <div style={{ maxWidth: 420, margin: '48px auto' }}>
-        <Auth supabaseClient={supabase} appearance={{ theme: ThemeSupa }} />
+      <div
+        style={{
+          minHeight: '100vh',
+          background: '#ffffff',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: 24,
+        }}
+      >
+        <div style={{ width: '100%', maxWidth: 420 }}>
+          <Auth
+            supabaseClient={supabase}
+            appearance={{
+              theme: ThemeSupa,
+              variables: {
+                default: {
+                  colors: {
+                    brand: '#111827',
+                    brandAccent: '#111827',
+                    defaultButtonBackground: '#ffffff',
+                    defaultButtonBackgroundHover: '#f9fafb',
+                    defaultButtonBorder: '#e5e7eb',
+                    defaultButtonText: '#111827',
+                    inputBackground: '#ffffff',
+                    inputBorder: '#e5e7eb',
+                    inputBorderHover: '#cbd5e1',
+                    inputText: '#111827',
+                    messageText: '#111827',
+                  },
+                },
+              },
+            }}
+          />
+        </div>
       </div>
     )
   }
