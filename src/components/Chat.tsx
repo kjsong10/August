@@ -15,6 +15,9 @@ type Message = {
   role: 'system' | 'user' | 'assistant'
   content: string
   created_at: string
+  // Optional attachments metadata from DB
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  attachments?: any
 }
 
 export default function Chat() {
@@ -32,6 +35,9 @@ export default function Chat() {
   const [pendingQuery, setPendingQuery] = useState<string | null>(null)
   const [hoveredConversationId, setHoveredConversationId] = useState<string | null>(null)
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
+  const [attachments, setAttachments] = useState<
+    Array<{ id: string; name: string; type: string; size: number; dataUrl?: string; textContent?: string }>
+  >([])
   const MODEL_OPTIONS = [
     { value: 'openai/gpt-oss-20b:free', label: 'GPT-OSS-20B (free)' },
     { value: 'z-ai/glm-4.5-air:free', label: 'GLM-4.5 Air (free)' },
@@ -179,7 +185,7 @@ export default function Chat() {
 
   async function handleSend() {
     const text = (pendingQuery ?? input).trim()
-    if (!text || sending) return
+    if ((!text && attachments.length === 0) || sending) return
     setSending(true)
     try {
       const conversationId = await ensureConversation()
@@ -190,7 +196,15 @@ export default function Chat() {
       if (pendingQuery) setPendingQuery(null)
       const { data: insertedUser } = await supabase
         .from('messages')
-        .insert({ conversation_id: conversationId, role: 'user', content: userMessageContent })
+        .insert({
+          conversation_id: conversationId,
+          role: 'user',
+          content: userMessageContent,
+          attachments:
+            attachments.length > 0
+              ? attachments.map((a) => ({ name: a.name, type: a.type, size: a.size }))
+              : null,
+        })
         .select('*')
         .single()
       if (insertedUser) {
@@ -206,11 +220,34 @@ export default function Chat() {
           .eq('id', conversationId)
       }
 
-      // Prepare the prompt
-      const messagesForLLM = [
+      // Prepare the prompt; if attachments exist, use multimodal content parts
+      const messagesForLLM: Array<{ role: 'system' | 'user' | 'assistant'; content: unknown }> = [
         ...messages.map((m) => ({ role: m.role, content: m.content })),
-        { role: 'user' as const, content: userMessageContent },
       ]
+      if (attachments.length > 0) {
+        // Build a single text message so text-only models like GPT-OSS-20B fully read it
+        let combined = userMessageContent || '(no text, files attached)'
+        combined += '\n\n[Attached files provided as inline text below]'
+        const images: { url: string; name: string }[] = []
+        for (const a of attachments) {
+          if (a.textContent) {
+            combined += `\n\n--- File: ${a.name} ---\n${a.textContent.slice(0, 20000)}`
+          } else if (a.type.startsWith('image/') && a.dataUrl) {
+            images.push({ url: a.dataUrl, name: a.name })
+          } else {
+            combined += `\n\n--- File: ${a.name} ---\n[No extractable text found. Type: ${a.type}, ${a.size} bytes]`
+          }
+        }
+        messagesForLLM.push({ role: 'user', content: combined })
+        // Optionally include images as a follow-up message if any were attached
+        if (images.length > 0) {
+          const parts = images.map((img) => ({ type: 'image_url', image_url: { url: img.url } }))
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          messagesForLLM.push({ role: 'user', content: parts as any })
+        }
+      } else {
+        messagesForLLM.push({ role: 'user', content: userMessageContent })
+      }
 
       // Call Edge Function with user access token
       const { data: sessionData } = await supabase.auth.getSession()
@@ -269,7 +306,104 @@ export default function Chat() {
       alert('Failed to send message')
     } finally {
       setSending(false)
+      setAttachments([])
     }
+  }
+
+  function readFileAsDataURL(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => resolve(String(reader.result))
+      reader.onerror = () => reject(reader.error)
+      reader.readAsDataURL(file)
+    })
+  }
+
+  function readFileAsText(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => resolve(String(reader.result))
+      reader.onerror = () => reject(reader.error)
+      reader.readAsText(file)
+    })
+  }
+
+  async function extractPdfText(file: File): Promise<string> {
+    try {
+      const arrayBuffer = await file.arrayBuffer()
+      // Dynamic import of PDF.js core
+      const pdfjs = await import('pdfjs-dist/build/pdf')
+      // Set worker from CDN matching installed version
+      pdfjs.GlobalWorkerOptions.workerSrc = 'https://unpkg.com/pdfjs-dist@5.4.54/build/pdf.worker.min.js'
+      const loadingTask = pdfjs.getDocument({ data: arrayBuffer })
+      const pdf = await loadingTask.promise
+      let fullText = ''
+      for (let i = 1; i <= pdf.numPages; i += 1) {
+        const page = await pdf.getPage(i)
+        const content = await page.getTextContent()
+        const pageText = content.items.map((it: unknown) => {
+          const anyIt = it as { str?: string }
+          return anyIt.str ?? ''
+        }).join(' ')
+        fullText += `\n\n--- Page ${i} ---\n${pageText}`
+      }
+      return fullText.trim()
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('PDF text extraction failed:', err)
+      return ''
+    }
+  }
+
+  async function extractDocxText(file: File): Promise<string> {
+    try {
+      const JSZip = (await import('jszip')).default
+      const zip = await JSZip.loadAsync(await file.arrayBuffer())
+      const docXml = await zip.file('word/document.xml')?.async('string')
+      if (!docXml) return ''
+      const text = docXml
+        .replace(/<w:p[^>]*>/g, '\n')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+\n/g, '\n')
+        .replace(/\s{2,}/g, ' ')
+        .trim()
+      return text
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('DOCX text extraction failed:', err)
+      return ''
+    }
+  }
+
+  async function handleFiles(files: File[]) {
+    const next: Array<{ id: string; name: string; type: string; size: number; dataUrl?: string; textContent?: string }> = []
+    for (const f of files) {
+      const item: { id: string; name: string; type: string; size: number; dataUrl?: string; textContent?: string } = {
+        id: `${f.name}-${f.size}-${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`,
+        name: f.name,
+        type: f.type || 'application/octet-stream',
+        size: f.size,
+      }
+      try {
+        if (item.type.startsWith('image/')) {
+          item.dataUrl = await readFileAsDataURL(f)
+        } else if (/^(text\/|application\/(json|xml|csv))/.test(item.type) || /\.(txt|md|json|csv)$/i.test(item.name)) {
+          item.textContent = await readFileAsText(f)
+        } else if (item.type === 'application/pdf' || /\.pdf$/i.test(item.name)) {
+          item.textContent = await extractPdfText(f)
+        } else if (
+          item.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
+          /\.docx$/i.test(item.name)
+        ) {
+          item.textContent = await extractDocxText(f)
+        }
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn('Failed to read file for preview', e)
+      }
+      next.push(item)
+    }
+    setAttachments((prev) => [...prev, ...next])
   }
 
   async function handleNewConversation() {
@@ -588,14 +722,87 @@ export default function Chat() {
           </div>
         </div>
 
-        {/* Composer */}
+        {/* Composer with drag-and-drop and attachments */}
         <div style={{ borderTop: '1px solid #e5e7eb', padding: 12, background: '#ffffff' }}>
-          <div style={{ maxWidth: 800, margin: '0 auto', display: 'flex', gap: 8 }}>
-            <textarea
+          <div
+            onDragOver={(e) => {
+              e.preventDefault()
+            }}
+            onDrop={(e) => {
+              e.preventDefault()
+              const files = Array.from(e.dataTransfer.files)
+              void handleFiles(files)
+            }}
+            style={{ maxWidth: 800, margin: '0 auto', display: 'flex', gap: 8, flexDirection: 'column' }}
+          >
+            {attachments.length > 0 && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                {attachments.map((a) => (
+                  <div
+                    key={a.id}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      padding: '6px 8px',
+                      border: '1px solid #e5e7eb',
+                      borderRadius: 8,
+                      background: '#ffffff',
+                    }}
+                  >
+                    {a.dataUrl && a.type.startsWith('image/') ? (
+                      // eslint-disable-next-line jsx-a11y/alt-text
+                      <img src={a.dataUrl} style={{ width: 32, height: 32, objectFit: 'cover', borderRadius: 4 }} />
+                    ) : (
+                      <span style={{ fontSize: 12, color: '#6b7280' }}>{a.type.split('/')[0].toUpperCase()}</span>
+                    )}
+                    <span style={{ maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.name}</span>
+                    <button
+                      onClick={() => setAttachments((prev) => prev.filter((x) => x.id !== a.id))}
+                      style={{
+                        marginLeft: 'auto',
+                        border: '1px solid #e5e7eb',
+                        background: '#ffffff',
+                        color: '#111827',
+                        borderRadius: 6,
+                        padding: '4px 6px',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      Remove
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: 8 }}>
+              <label
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  border: '1px solid #e5e7eb',
+                  background: '#ffffff',
+                  color: '#111827',
+                  borderRadius: 10,
+                  padding: '0 12px',
+                  cursor: 'pointer',
+                }}
+              >
+                <input
+                  type="file"
+                  multiple
+                  accept="image/*,.txt,.md,.json,.csv,.pdf,.docx"
+                  style={{ display: 'none' }}
+                  onChange={(e) => void handleFiles(Array.from(e.target.files || []))}
+                />
+                <span>Attach</span>
+              </label>
+              <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
               rows={2}
-              placeholder="Type your message…"
+                placeholder="Type your message… or drop files here"
               style={{
                 flex: 1,
                 resize: 'vertical',
@@ -613,20 +820,21 @@ export default function Chat() {
                   handleSend()
                 }
               }}
-            />
-            <button
-              onClick={handleSend}
-              disabled={sending || !input.trim()}
-              style={{
-                padding: '0 16px',
-                borderRadius: 10,
-                background: sending || !input.trim() ? '#9ca3af' : '#111827',
-                color: 'white',
-                border: 'none',
-              }}
-            >
-              {sending ? 'Sending…' : 'Send'}
-            </button>
+              />
+              <button
+                onClick={handleSend}
+                disabled={sending || (!input.trim() && attachments.length === 0)}
+                style={{
+                  padding: '0 16px',
+                  borderRadius: 10,
+                  background: sending || (!input.trim() && attachments.length === 0) ? '#9ca3af' : '#111827',
+                  color: 'white',
+                  border: 'none',
+                }}
+              >
+                {sending ? 'Sending…' : 'Send'}
+              </button>
+            </div>
           </div>
         </div>
       </main>
@@ -707,5 +915,6 @@ export default function Chat() {
     </div>
   )
 }
+
 
 
