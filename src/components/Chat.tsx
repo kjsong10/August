@@ -49,6 +49,7 @@ export default function Chat() {
     },
   ] as const
   const [selectedModel, setSelectedModel] = useState<string>(MODEL_OPTIONS[0].value)
+  const [enableWeb, setEnableWeb] = useState<boolean>(false)
 
   useEffect(() => {
     let isMounted = true
@@ -113,10 +114,15 @@ export default function Chat() {
   useEffect(() => {
     const saved = localStorage.getItem('august:selectedModel')
     if (saved) setSelectedModel(saved)
+    const savedWeb = localStorage.getItem('august:enableWeb')
+    if (savedWeb != null) setEnableWeb(savedWeb === 'true')
   }, [])
   useEffect(() => {
     localStorage.setItem('august:selectedModel', selectedModel)
   }, [selectedModel])
+  useEffect(() => {
+    localStorage.setItem('august:enableWeb', String(enableWeb))
+  }, [enableWeb])
 
   const activeConversation = useMemo(
     () => conversations.find((c) => c.id === activeId) ?? null,
@@ -253,7 +259,7 @@ export default function Chat() {
       const { data: sessionData } = await supabase.auth.getSession()
       const accessToken = sessionData.session?.access_token
       const { data: response, error } = await supabase.functions.invoke('openrouter-chat', {
-        body: { messages: messagesForLLM, model: selectedModel },
+        body: { messages: messagesForLLM, model: selectedModel, enableWeb },
         headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
       })
       if (error) throw error
@@ -331,10 +337,14 @@ export default function Chat() {
   async function extractPdfText(file: File): Promise<string> {
     try {
       const arrayBuffer = await file.arrayBuffer()
-      // Dynamic import of PDF.js core
-      const pdfjs = await import('pdfjs-dist/build/pdf')
-      // Set worker from CDN matching installed version
-      pdfjs.GlobalWorkerOptions.workerSrc = 'https://unpkg.com/pdfjs-dist@5.4.54/build/pdf.worker.min.js'
+      // Import PDF.js core and a same-origin worker URL via Vite
+      const [{ default: workerUrl }, pdfjs] = await Promise.all([
+        import('pdfjs-dist/build/pdf.worker.min.mjs?url'),
+        import('pdfjs-dist/build/pdf'),
+      ])
+      // Point PDF.js to the bundled worker URL (served by Vite on same origin)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ;(pdfjs as any).GlobalWorkerOptions.workerSrc = workerUrl
       const loadingTask = pdfjs.getDocument({ data: arrayBuffer })
       const pdf = await loadingTask.promise
       let fullText = ''
@@ -375,9 +385,32 @@ export default function Chat() {
     }
   }
 
+  async function extractImageOcr(file: File): Promise<string> {
+    try {
+      const Tesseract = (await import('tesseract.js')).default
+      const { data } = await Tesseract.recognize(file, 'eng')
+      return (data?.text || '').trim()
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('Image OCR failed:', err)
+      return ''
+    }
+  }
+
   async function handleFiles(files: File[]) {
+    const maxCount = 5
+    const maxBytes = 10 * 1024 * 1024
+    const remaining = Math.max(0, maxCount - attachments.length)
+    const accepted = files.slice(0, remaining)
+    if (files.length > remaining) {
+      alert(`You can attach up to ${maxCount} files per message.`)
+    }
     const next: Array<{ id: string; name: string; type: string; size: number; dataUrl?: string; textContent?: string }> = []
-    for (const f of files) {
+    for (const f of accepted) {
+      if (f.size > maxBytes) {
+        alert(`File "${f.name}" exceeds 10MB and was skipped.`)
+        continue
+      }
       const item: { id: string; name: string; type: string; size: number; dataUrl?: string; textContent?: string } = {
         id: `${f.name}-${f.size}-${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`,
         name: f.name,
@@ -387,6 +420,8 @@ export default function Chat() {
       try {
         if (item.type.startsWith('image/')) {
           item.dataUrl = await readFileAsDataURL(f)
+          const ocrText = await extractImageOcr(f)
+          if (ocrText) item.textContent = ocrText
         } else if (/^(text\/|application\/(json|xml|csv))/.test(item.type) || /\.(txt|md|json|csv)$/i.test(item.name)) {
           item.textContent = await readFileAsText(f)
         } else if (item.type === 'application/pdf' || /\.pdf$/i.test(item.name)) {
@@ -396,6 +431,8 @@ export default function Chat() {
           /\.docx$/i.test(item.name)
         ) {
           item.textContent = await extractDocxText(f)
+        } else {
+          item.textContent = ''
         }
       } catch (e) {
         // eslint-disable-next-line no-console
@@ -631,6 +668,16 @@ export default function Chat() {
                 </option>
               ))}
             </select>
+
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, marginLeft: 8, color: '#111827' }} title="Enable web browsing tools">
+              <input
+                type="checkbox"
+                checked={enableWeb}
+                onChange={(e) => setEnableWeb(e.target.checked)}
+                style={{ width: 16, height: 16 }}
+              />
+              <span>Use web</span>
+            </label>
 
             <div style={{ marginLeft: 'auto', position: 'relative' }}>
               <button

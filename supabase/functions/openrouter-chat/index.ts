@@ -49,7 +49,7 @@ serve(async (req) => {
     })
   }
 
-  let body: { messages?: ChatMessage[]; model?: string }
+  let body: { messages?: ChatMessage[]; model?: string; enableWeb?: boolean }
   try {
     body = await req.json()
   } catch (_) {
@@ -61,6 +61,7 @@ serve(async (req) => {
 
   const messages = body.messages ?? []
   const model = body.model || 'openai/gpt-oss-20b:free'
+  const enableWeb = Boolean(body.enableWeb)
   if (!Array.isArray(messages) || messages.length === 0) {
     return new Response(JSON.stringify({ error: 'messages must be a non-empty array' }), {
       status: 400,
@@ -76,7 +77,7 @@ serve(async (req) => {
       'HTTP-Referer': 'https://example.com',
       'X-Title': 'August Chat',
     },
-    body: JSON.stringify({ model, messages, stream: false }),
+    body: JSON.stringify({ model, messages, stream: false, tools: enableWeb ? [{ type: 'web_search' }] : undefined }),
   })
 
   if (!resp.ok) {
