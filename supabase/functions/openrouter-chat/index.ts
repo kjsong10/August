@@ -69,7 +69,7 @@ serve(async (req) => {
     })
   }
 
-  const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+  let resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${OPENROUTER_API_KEY}`,
@@ -80,9 +80,28 @@ serve(async (req) => {
     body: JSON.stringify({ model, messages, stream: false, tools: enableWeb ? [{ type: 'web_search' }] : undefined }),
   })
 
+  // Fallback: retry without tools if web tools are unsupported
+  if (!resp.ok && enableWeb) {
+    resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://example.com',
+        'X-Title': 'August Chat',
+      },
+      body: JSON.stringify({ model, messages, stream: false }),
+    })
+  }
+
   if (!resp.ok) {
-    const errText = await resp.text()
-    return new Response(JSON.stringify({ error: 'OpenRouter error', detail: errText }), {
+    let detail: unknown
+    try {
+      detail = await resp.json()
+    } catch (_) {
+      detail = await resp.text()
+    }
+    return new Response(JSON.stringify({ error: 'OpenRouter error', detail }), {
       status: 500,
       headers: { 'Content-Type': 'application/json', ...corsHeaders(origin) },
     })
@@ -94,5 +113,3 @@ serve(async (req) => {
     headers: { 'Content-Type': 'application/json', ...corsHeaders(origin) },
   })
 })
-
-

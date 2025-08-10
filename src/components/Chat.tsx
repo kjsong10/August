@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { supabase } from '../lib/supabaseClient'
 
 type Conversation = {
@@ -38,6 +38,7 @@ export default function Chat() {
   const [attachments, setAttachments] = useState<
     Array<{ id: string; name: string; type: string; size: number; dataUrl?: string; textContent?: string }>
   >([])
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
   const MODEL_OPTIONS = [
     { value: 'openai/gpt-oss-20b:free', label: 'GPT-OSS-20B (free)' },
     { value: 'z-ai/glm-4.5-air:free', label: 'GLM-4.5 Air (free)' },
@@ -47,6 +48,7 @@ export default function Chat() {
       value: 'cognitivecomputations/dolphin-mistral-24b-venice-edition:free',
       label: 'Dolphin Mistral 24B Venice (free)',
     },
+    { value: 'google/gemini-2.0-flash-exp:free', label: 'Gemini 2.0 Flash (free)' },
   ] as const
   const [selectedModel, setSelectedModel] = useState<string>(MODEL_OPTIONS[0].value)
   const [enableWeb, setEnableWeb] = useState<boolean>(false)
@@ -196,23 +198,43 @@ export default function Chat() {
     try {
       const conversationId = await ensureConversation()
 
-      // Insert user message
-      const userMessageContent = text
+      // Insert user message. If only files were attached, persist filenames as content fallback
+      const userMessageContent = text || (attachments.length > 0 ? `Attached files: ${attachments.map((a) => a.name).join(', ')}` : '')
       setInput('')
       if (pendingQuery) setPendingQuery(null)
-      const { data: insertedUser } = await supabase
-        .from('messages')
-        .insert({
-          conversation_id: conversationId,
-          role: 'user',
-          content: userMessageContent,
-          attachments:
-            attachments.length > 0
-              ? attachments.map((a) => ({ name: a.name, type: a.type, size: a.size }))
-              : null,
-        })
-        .select('*')
-        .single()
+      const insertPayload: Record<string, unknown> = {
+        conversation_id: conversationId,
+        role: 'user',
+        content: userMessageContent,
+      }
+      if (attachments.length > 0) {
+        insertPayload.attachments = attachments.map((a) => ({ name: a.name, type: a.type, size: a.size }))
+      }
+      let insertedUser: unknown | null = null
+      let insertError: unknown | null = null
+      try {
+        const { data, error } = await supabase
+          .from('messages')
+          .insert(insertPayload)
+          .select('*')
+          .single()
+        insertedUser = data
+        insertError = error as unknown | null
+      } catch (e) {
+        insertError = e
+      }
+
+      if (!insertedUser && insertError && attachments.length > 0) {
+        // Fallback in case the DB doesn't have the attachments column yet
+        const fallbackContent = userMessageContent || `Attached files: ${attachments.map((a) => a.name).join(', ')}`
+        const { data } = await supabase
+          .from('messages')
+          .insert({ conversation_id: conversationId, role: 'user', content: fallbackContent })
+          .select('*')
+          .single()
+        insertedUser = data
+      }
+
       if (insertedUser) {
         setMessages((prev) => [...prev, insertedUser as Message])
       }
@@ -743,12 +765,15 @@ export default function Chat() {
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 {messages.map((m) => {
                   const isUser = m.role === 'user'
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  const atts = (m as any).attachments as Array<{ name: string; type?: string }> | undefined
+                  const hasAtts = Array.isArray(atts) && atts.length > 0
+                  const hasText = Boolean(m.content && m.content.trim() !== '')
                   return (
                     <div key={m.id} style={{ display: 'flex', justifyContent: isUser ? 'flex-end' : 'flex-start' }}>
                       <div
                         style={{
                           maxWidth: '85%',
-                          whiteSpace: 'pre-wrap',
                           background: isUser ? '#93c5fd' : '#ffffff',
                           border: '1px solid #e5e7eb',
                           color: '#111827',
@@ -759,7 +784,42 @@ export default function Chat() {
                           boxShadow: '0 1px 1px rgba(0,0,0,0.03)',
                         }}
                       >
-                        {m.content}
+                        {hasAtts && (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: hasText ? 8 : 0 }}>
+                            {atts!.map((att, idx) => (
+                              <div key={`${m.id}-att-${idx}`} style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: 10,
+                                padding: '8px 10px',
+                                borderRadius: 10,
+                                background: isUser ? 'rgba(255,255,255,0.6)' : '#f9fafb',
+                                border: '1px solid #e5e7eb',
+                              }}>
+                                <div style={{
+                                  width: 28,
+                                  height: 28,
+                                  borderRadius: 8,
+                                  background: '#f472b6',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'center',
+                                  color: 'white',
+                                  fontSize: 12,
+                                  fontWeight: 700,
+                                  flex: '0 0 auto',
+                                }}>
+                                  {(att.type || 'file').split('/')[1]?.slice(0,3)?.toUpperCase() || 'FILE'}
+                                </div>
+                                <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+                                  <div style={{ fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 420 }}>{att.name}</div>
+                                  <div style={{ fontSize: 12, color: '#6b7280' }}>{(att.type || 'File').toUpperCase()}</div>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        {hasText && <div style={{ whiteSpace: 'pre-wrap' }}>{m.content}</div>}
                       </div>
                     </div>
                   )
@@ -841,7 +901,24 @@ export default function Chat() {
                   multiple
                   accept="image/*,.txt,.md,.json,.csv,.pdf,.docx"
                   style={{ display: 'none' }}
-                  onChange={(e) => void handleFiles(Array.from(e.target.files || []))}
+                  ref={fileInputRef}
+                  onClick={(e) => {
+                    // Allow selecting the same file again
+                    ;(e.currentTarget as HTMLInputElement).value = ''
+                  }}
+                  onChange={(e) => {
+                    const inputEl = e.currentTarget
+                    const files = Array.from(inputEl.files || [])
+                    if (files.length > 0) {
+                      ;(async () => {
+                        await handleFiles(files)
+                        // Reset input so choosing the same file fires change
+                        inputEl.value = ''
+                      })()
+                    } else {
+                      inputEl.value = ''
+                    }
+                  }}
                 />
                 <span>Attach</span>
               </label>
