@@ -38,6 +38,11 @@ export default function Chat() {
   const [attachments, setAttachments] = useState<
     Array<{ id: string; name: string; type: string; size: number; dataUrl?: string; textContent?: string }>
   >([])
+  const [rateLimited, setRateLimited] = useState(false)
+  const [attachHover, setAttachHover] = useState(false)
+  const [webHover, setWebHover] = useState(false)
+  const [sendHover, setSendHover] = useState(false)
+  const [darkMode, setDarkMode] = useState(false)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const MODEL_OPTIONS = [
     { value: 'openai/gpt-oss-20b:free', label: 'GPT-OSS-20B (free)' },
@@ -95,6 +100,24 @@ export default function Chat() {
     })()
   }, [userId])
 
+  // Theme persistence: load on mount
+  useEffect(() => {
+    const savedTheme = localStorage.getItem('august:theme')
+    if (savedTheme === 'dark') {
+      setDarkMode(true)
+      document.documentElement.setAttribute('data-theme', 'dark')
+    } else if (savedTheme === 'light') {
+      setDarkMode(false)
+      document.documentElement.setAttribute('data-theme', 'light')
+    }
+  }, [])
+
+  // Sync theme to document and storage
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', darkMode ? 'dark' : 'light')
+    localStorage.setItem('august:theme', darkMode ? 'dark' : 'light')
+  }, [darkMode])
+
   // Homepage prompt disabled: do not ingest ?q anymore
   useEffect(() => {
     setPendingQuery(null)
@@ -125,6 +148,28 @@ export default function Chat() {
   useEffect(() => {
     localStorage.setItem('august:enableWeb', String(enableWeb))
   }, [enableWeb])
+
+  // Models known to support web_search tool via OpenRouter
+  const WEB_OK_SET = useMemo(() =>
+    new Set<string>([
+      'google/gemini-2.0-flash-exp:free',
+      // Add more web-capable models here if enabled in your account (e.g., perplexity online models)
+    ]),
+  [])
+
+  const VISIBLE_MODEL_OPTIONS = useMemo(() => {
+    if (!enableWeb) return MODEL_OPTIONS as ReadonlyArray<{ value: string; label: string }>
+    return (MODEL_OPTIONS as ReadonlyArray<{ value: string; label: string }>).filter(m => WEB_OK_SET.has(m.value))
+  }, [enableWeb])
+
+  // Ensure there is a valid selection when toggling web on
+  useEffect(() => {
+    if (!enableWeb) return
+    const visible = VISIBLE_MODEL_OPTIONS
+    if (visible.length === 0) return
+    const has = visible.some(v => v.value === selectedModel)
+    if (!has) setSelectedModel(visible[0].value)
+  }, [enableWeb, selectedModel, VISIBLE_MODEL_OPTIONS])
 
   const activeConversation = useMemo(
     () => conversations.find((c) => c.id === activeId) ?? null,
@@ -331,10 +376,60 @@ export default function Chat() {
     } catch (err) {
       // eslint-disable-next-line no-console
       console.error(err)
+      // If Edge Function returned non-2xx (e.g., 429 from provider), show retry banner
+      setRateLimited(true)
       alert('Failed to send message')
     } finally {
       setSending(false)
       setAttachments([])
+    }
+  }
+
+  async function retryAssistantCall() {
+    setRateLimited(false)
+    try {
+      const { data: sessionData } = await supabase.auth.getSession()
+      const accessToken = sessionData.session?.access_token
+      const messagesForLLM = messages.map((m) => ({ role: m.role, content: m.content }))
+      const { data: response, error } = await supabase.functions.invoke('openrouter-chat', {
+        body: { messages: messagesForLLM, model: selectedModel, enableWeb },
+        headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
+      })
+      if (error) throw error
+      const assistantText = (response?.content as string) ?? ''
+      if (!assistantText) return
+      const tempId = `temp-${Date.now()}`
+      setMessages((prev) => [
+        ...prev,
+        { id: tempId, conversation_id: activeId!, role: 'assistant', content: '', created_at: new Date().toISOString() } as Message,
+      ])
+      await new Promise<void>((resolve) => {
+        const total = assistantText.length
+        let i = 0
+        const step = Math.max(1, Math.floor(total / 120))
+        const interval = setInterval(() => {
+          i = Math.min(total, i + step)
+          const partial = assistantText.slice(0, i)
+          setMessages((prev) => prev.map((m) => (m.id === tempId ? { ...m, content: partial } : m)))
+          if (i >= total) {
+            clearInterval(interval)
+            resolve()
+          }
+        }, 20)
+      })
+      const { data: insertedAssistant } = await supabase
+        .from('messages')
+        .insert({ conversation_id: activeId!, role: 'assistant', content: assistantText })
+        .select('*')
+        .single()
+      if (insertedAssistant) {
+        const finalMsg = insertedAssistant as Message
+        setMessages((prev) => prev.map((m) => (m.id === tempId ? finalMsg : m)))
+      }
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error(e)
+      alert('Retry failed')
     }
   }
 
@@ -489,8 +584,8 @@ export default function Chat() {
         style={{
           width: sidebarCollapsed ? 64 : 260,
           transition: 'width 200ms ease',
-          background: '#ffffff',
-          borderRight: '1px solid #e5e7eb',
+          background: 'var(--panel)',
+          borderRight: '1px solid var(--border)',
           display: 'flex',
           flexDirection: 'column',
           padding: 12,
@@ -585,9 +680,9 @@ export default function Chat() {
                 width: '100%',
                 padding: '10px 12px 10px 36px',
                 borderRadius: 8,
-                border: '1px solid #e5e7eb',
-                background: '#ffffff',
-                color: '#111827',
+                border: '1px solid var(--border)',
+                background: 'var(--panel)',
+                color: 'var(--text)',
                 outline: 'none',
                 boxSizing: 'border-box',
               }}
@@ -595,7 +690,7 @@ export default function Chat() {
           </div>
         )}
         {!sidebarCollapsed && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, transition: 'opacity 200ms ease' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 2, transition: 'opacity 200ms ease' }}>
             {groupedConversations.map((group) => (
               <div key={group.label}>
                 <div style={{ fontSize: 12, color: '#6b7280', margin: '8px 4px' }}>{group.label}</div>
@@ -615,13 +710,15 @@ export default function Chat() {
                         border: 'none',
                         background:
                           c.id === activeId
-                            ? '#f3f4f6'
+                            ? 'var(--hover)'
                             : hoveredConversationId === c.id
-                            ? '#f9fafb'
-                            : '#ffffff',
-                        color: '#111827',
+                            ? 'var(--hover)'
+                            : 'var(--panel)',
+                        color: 'var(--text)',
                         width: '100%',
                         transition: 'background 150ms ease',
+                        outline: 'none',
+                        boxShadow: 'none',
                       }}
                       title={c.title || 'Untitled chat'}
                     >
@@ -664,9 +761,9 @@ export default function Chat() {
       </aside>
 
       {/* Chat area */}
-      <main style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+      <main style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--bg)' }}>
         {/* Top bar with model selector */}
-        <div style={{ borderBottom: '1px solid #e5e7eb', background: '#ffffff' }}>
+        <div style={{ borderBottom: '1px solid var(--border)', background: 'var(--panel)' }}>
           <div style={{ maxWidth: 1000, margin: '0 auto', padding: '8px 16px', display: 'flex', alignItems: 'center', gap: 12 }}>
             <select
               id="model"
@@ -676,40 +773,53 @@ export default function Chat() {
                 border: 'none',
                 borderRadius: 8,
                 padding: '8px 12px',
-                background: '#ffffff',
-                color: '#111827',
+                background: 'var(--panel)',
+                color: 'var(--text)',
                 outline: 'none',
                 boxShadow: 'none',
                 cursor: 'pointer',
                 fontSize: '1.5em',
+                fontFamily:
+                  "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', sans-serif",
+                fontWeight: 500,
               }}
             >
-              {MODEL_OPTIONS.map((opt) => (
+              {VISIBLE_MODEL_OPTIONS.map((opt) => (
                 <option key={opt.value} value={opt.value}>
                   {opt.label}
                 </option>
               ))}
             </select>
 
-            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, marginLeft: 8, color: '#111827' }} title="Enable web browsing tools">
-              <input
-                type="checkbox"
-                checked={enableWeb}
-                onChange={(e) => setEnableWeb(e.target.checked)}
-                style={{ width: 16, height: 16 }}
-              />
-              <span>Use web</span>
-            </label>
+            {/* Use web toggle moved to composer */}
 
-            <div style={{ marginLeft: 'auto', position: 'relative' }}>
+            <div style={{ marginLeft: 'auto', position: 'relative', display: 'flex', alignItems: 'center', gap: 8 }}>
+              {/* Theme toggle */}
+              <button
+                onClick={() => setDarkMode((v) => !v)}
+                title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  width: 32,
+                  height: 32,
+                  borderRadius: 9999,
+                  border: '1px solid var(--border)',
+                  background: 'var(--panel)',
+                  cursor: 'pointer',
+                }}
+              >
+                <img src={darkMode ? '/icons/theme-sun-light.svg' : '/icons/theme-moon.svg'} width={18} height={18} alt="theme" />
+              </button>
               <button
                 onClick={() => setAccountOpen((v) => !v)}
                 style={{
                   padding: '6px 10px',
                   borderRadius: 999,
-                  border: '1px solid #e5e7eb',
-                  background: '#ffffff',
-                  color: '#111827',
+                  border: '1px solid var(--border)',
+                  background: 'var(--panel)',
+                  color: 'var(--text)',
                   cursor: 'pointer',
                 }}
                 title={userEmail || ''}
@@ -722,8 +832,8 @@ export default function Chat() {
                     position: 'absolute',
                     right: 0,
                     marginTop: 8,
-                    background: '#ffffff',
-                    border: '1px solid #e5e7eb',
+                    background: 'var(--panel)',
+                    border: '1px solid var(--border)',
                     borderRadius: 8,
                     padding: '10px 12px',
                     minWidth: 220,
@@ -731,9 +841,9 @@ export default function Chat() {
                     zIndex: 10,
                   }}
                 >
-                  <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 6 }}>Email</div>
-                  <div style={{ fontSize: 14, color: '#111827', wordBreak: 'break-all' }}>{userEmail || '—'}</div>
-                  <div style={{ height: 1, background: '#e5e7eb', margin: '10px -12px' }} />
+                  <div style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 6 }}>Email</div>
+                  <div style={{ fontSize: 14, color: 'var(--text)', wordBreak: 'break-all' }}>{userEmail || '—'}</div>
+                  <div style={{ height: 1, background: 'var(--border)', margin: '10px -12px' }} />
                   <button
                     onClick={handleSignOut}
                     style={{
@@ -741,8 +851,8 @@ export default function Chat() {
                       textAlign: 'left',
                       padding: '8px 12px',
                       borderRadius: 6,
-                      border: '1px solid #e5e7eb',
-                      background: '#ffffff',
+                      border: '1px solid var(--border)',
+                      background: 'var(--panel)',
                       color: '#b91c1c',
                       cursor: 'pointer',
                     }}
@@ -756,7 +866,7 @@ export default function Chat() {
         </div>
         {/* Messages scroll area */}
         <div style={{ flex: 1, overflowY: 'auto' }}>
-          <div style={{ maxWidth: 800, margin: '0 auto', padding: '24px 16px' }}>
+            <div style={{ maxWidth: 800, margin: '0 auto', padding: '24px 16px', color: 'var(--text)' }}>
             {messages.length === 0 ? (
               <div style={{ color: '#6b7280', textAlign: 'center', marginTop: 40 }}>
                 Start the conversation…
@@ -774,9 +884,9 @@ export default function Chat() {
                       <div
                         style={{
                           maxWidth: '85%',
-                          background: isUser ? '#93c5fd' : '#ffffff',
-                          border: '1px solid #e5e7eb',
-                          color: '#111827',
+                          background: isUser ? 'var(--user-bubble)' : 'var(--assistant-bubble)',
+                          border: '1px solid var(--border)',
+                          color: 'var(--text)',
                           padding: '10px 12px',
                           borderRadius: 12,
                           borderTopRightRadius: isUser ? 4 : 12,
@@ -830,7 +940,7 @@ export default function Chat() {
         </div>
 
         {/* Composer with drag-and-drop and attachments */}
-        <div style={{ borderTop: '1px solid #e5e7eb', padding: 12, background: '#ffffff' }}>
+        <div style={{ borderTop: '1px solid var(--border)', padding: 12, background: 'var(--panel)' }}>
           <div
             onDragOver={(e) => {
               e.preventDefault()
@@ -842,6 +952,14 @@ export default function Chat() {
             }}
             style={{ maxWidth: 800, margin: '0 auto', display: 'flex', gap: 8, flexDirection: 'column' }}
           >
+            {rateLimited && (
+              <div style={{ color: '#b91c1c', display: 'flex', alignItems: 'center', gap: 8 }}>
+                Provider is rate-limited. Please retry.
+                <button onClick={retryAssistantCall} style={{ border: '1px solid var(--border)', padding: '4px 8px', borderRadius: 6, background: 'var(--panel)', cursor: 'pointer', color: 'var(--text)' }}>
+                  Retry
+                </button>
+              </div>
+            )}
             {attachments.length > 0 && (
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
                 {attachments.map((a) => (
@@ -882,19 +1000,33 @@ export default function Chat() {
                 ))}
               </div>
             )}
-            <div style={{ display: 'flex', gap: 8 }}>
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                border: '1px solid var(--border)',
+                background: 'var(--panel)',
+                borderRadius: 9999,
+                padding: '8px 10px',
+              }}
+            >
               <label
                 style={{
                   display: 'inline-flex',
                   alignItems: 'center',
-                  gap: 6,
-                  border: '1px solid #e5e7eb',
-                  background: '#ffffff',
-                  color: '#111827',
-                  borderRadius: 10,
-                  padding: '0 12px',
+                  justifyContent: 'center',
+                  width: 40,
+                  height: 40,
+                  borderRadius: 9999,
                   cursor: 'pointer',
+                  color: 'var(--text)',
+                  background: attachHover ? 'var(--hover)' : 'var(--panel)',
+                  border: 'none',
                 }}
+                title="Attach files"
+                onMouseEnter={() => setAttachHover(true)}
+                onMouseLeave={() => setAttachHover(false)}
               >
                 <input
                   type="file"
@@ -903,7 +1035,6 @@ export default function Chat() {
                   style={{ display: 'none' }}
                   ref={fileInputRef}
                   onClick={(e) => {
-                    // Allow selecting the same file again
                     ;(e.currentTarget as HTMLInputElement).value = ''
                   }}
                   onChange={(e) => {
@@ -912,7 +1043,6 @@ export default function Chat() {
                     if (files.length > 0) {
                       ;(async () => {
                         await handleFiles(files)
-                        // Reset input so choosing the same file fires change
                         inputEl.value = ''
                       })()
                     } else {
@@ -920,43 +1050,80 @@ export default function Chat() {
                     }
                   }}
                 />
-                <span>Attach</span>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden>
+                  <path d="M21 15V7a5 5 0 0 0-10 0v10a3 3 0 1 0 6 0V8" stroke="var(--text)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
               </label>
+
               <textarea
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              rows={2}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                rows={1}
                 placeholder="Type your message… or drop files here"
-              style={{
-                flex: 1,
-                resize: 'vertical',
-                background: '#ffffff',
-                border: '1px solid #e5e7eb',
-                borderRadius: 12,
-                padding: '10px 12px',
-                outline: 'none',
-                color: '#111827',
-                fontFamily: 'inherit',
-              }}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault()
-                  handleSend()
-                }
-              }}
+                style={{
+                  flex: 1,
+                  background: 'transparent',
+                  border: 'none',
+                  padding: '6px 8px',
+                  outline: 'none',
+                  color: 'var(--text)',
+                  fontFamily: 'inherit',
+                  resize: 'none',
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault()
+                    handleSend()
+                  }
+                }}
               />
+
+              {/* Web toggle icon (browser) */}
+              <button
+                onClick={() => setEnableWeb((v) => !v)}
+                title={enableWeb ? 'Web search: on' : 'Web search: off'}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  width: 40,
+                  height: 40,
+                  borderRadius: '50%',
+                  border: 'none',
+                  background: enableWeb ? (webHover ? '#0f172a' : 'var(--accent)') : (webHover ? 'var(--hover)' : 'var(--panel)'),
+                  color: enableWeb ? '#ffffff' : 'var(--text)',
+                  cursor: 'pointer',
+                }}
+                onMouseEnter={() => setWebHover(true)}
+                onMouseLeave={() => setWebHover(false)}
+              >
+                <img src={enableWeb ? '/icons/browser-light.svg' : '/icons/browser-dark.svg'} width={20} height={20} alt="web" />
+              </button>
+
               <button
                 onClick={handleSend}
                 disabled={sending || (!input.trim() && attachments.length === 0)}
+                title="Send"
                 style={{
-                  padding: '0 16px',
-                  borderRadius: 10,
-                  background: sending || (!input.trim() && attachments.length === 0) ? '#9ca3af' : '#111827',
-                  color: 'white',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  width: 40,
+                  height: 40,
+                  borderRadius: '50%',
                   border: 'none',
+                  background: sendHover ? 'var(--hover)' : 'var(--panel)',
+                  color: 'transparent',
+                  cursor: sending || (!input.trim() && attachments.length === 0) ? 'not-allowed' : 'pointer',
                 }}
+                onMouseEnter={() => setSendHover(true)}
+                onMouseLeave={() => setSendHover(false)}
               >
-                {sending ? 'Sending…' : 'Send'}
+                {(!input.trim() && attachments.length === 0) ? (
+                  <img src="/icons/up-arrow-grey.svg" width={22} height={22} alt="send" />
+                ) : (
+                  <img src={darkMode ? '/icons/up-arrow-grey.svg' : '/icons/up-arrow-black.svg'} width={22} height={22} alt="send" />
+                )}
               </button>
             </div>
           </div>
@@ -998,7 +1165,7 @@ export default function Chat() {
                   borderRadius: 8,
                   border: '1px solid #e5e7eb',
                   background: '#ffffff',
-                  color: '#111827',
+                  color: 'var(--text)',
                 }}
               >
                 Cancel

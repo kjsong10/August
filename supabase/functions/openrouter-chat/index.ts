@@ -69,38 +69,48 @@ serve(async (req) => {
     })
   }
 
-  let resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-      'Content-Type': 'application/json',
-      'HTTP-Referer': 'https://example.com',
-      'X-Title': 'August Chat',
-    },
-    body: JSON.stringify({ model, messages, stream: false, tools: enableWeb ? [{ type: 'web_search' }] : undefined }),
-  })
-
-  // Fallback: retry without tools if web tools are unsupported
-  if (!resp.ok && enableWeb) {
-    resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': 'https://example.com',
-        'X-Title': 'August Chat',
-      },
-      body: JSON.stringify({ model, messages, stream: false }),
-    })
+  const headers = {
+    Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+    'Content-Type': 'application/json',
+    'HTTP-Referer': 'https://example.com',
+    'X-Title': 'August Chat',
   }
 
-  if (!resp.ok) {
-    let detail: unknown
-    try {
-      detail = await resp.json()
-    } catch (_) {
-      detail = await resp.text()
+  // Try model-specific payloads first when web is enabled
+  const attempts: Array<Record<string, unknown>> = []
+  if (enableWeb) {
+    if (model.startsWith('google/')) {
+      attempts.push({ model, messages, stream: false, web_search: { enable: true } })
+      attempts.push({ model, messages, stream: false, tools: [{ type: 'web_search' }] })
+    } else {
+      attempts.push({ model, messages, stream: false, tools: [{ type: 'web_search' }] })
     }
+  }
+  // Always include a no-tools fallback
+  attempts.push({ model, messages, stream: false })
+
+  let resp: Response | null = null
+  let lastDetail: unknown = null
+  for (const payload of attempts) {
+    const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+    })
+    if (r.ok) {
+      resp = r
+      break
+    }
+    try {
+      lastDetail = await r.json()
+    } catch (_) {
+      lastDetail = await r.text()
+    }
+  }
+
+  if (!resp) {
+    let detail: unknown
+    detail = lastDetail
     return new Response(JSON.stringify({ error: 'OpenRouter error', detail }), {
       status: 500,
       headers: { 'Content-Type': 'application/json', ...corsHeaders(origin) },
