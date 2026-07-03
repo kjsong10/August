@@ -1,4 +1,4 @@
-# August Chat (React + TS + Vite + Supabase + OpenRouter)
+# PolyModel Chat (React + TS + Vite + Supabase + OpenRouter)
 
 Minimal ChatGPT-style app using Supabase for auth/DB and Edge Functions for calling OpenRouter.
 
